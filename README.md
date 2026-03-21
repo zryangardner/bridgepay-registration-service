@@ -1,3 +1,7 @@
+> ⚠️ **This repository has been renamed and archived.**
+> The active repository is [bridgepay-account-service](https://github.com/zryangardner/bridgepay-account-service).
+
+
 # BridgePay Registration Service
 
 > Authentication, user profiles, and social graph for the BridgePay platform.
