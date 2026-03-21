@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: bridgepay_registration
+      POSTGRES_USER: bridgepay_admin
+      POSTGRES_PASSWORD: bridgepay_local
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  registration-service:
+    build: .
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://bridgepay_admin:bridgepay_local@postgres:5432/bridgepay_registration
+      JWT_ACCESS_SECRET: local-dev-secret-change-in-prod
+      JWT_REFRESH_SECRET: local-dev-refresh-secret
+      NODE_ENV: development
+      CORS_ORIGIN: http://localhost:5173
+
+volumes:
+  postgres_data:

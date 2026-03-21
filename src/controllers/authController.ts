@@ -2,9 +2,11 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pool from '../db/pool';
-import type { RegisterRequest, LoginRequest, AuthTokenPayload } from '../models/user';
+import type { RegisterRequest, LoginRequest, AuthTokenPayload, PublicUser } from '../models/user';
+import type { AuthenticatedRequest } from '../middleware/authenticateToken';
 
 const SALT_ROUNDS = 12;
+const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 
 function issueAccessToken(payload: AuthTokenPayload): string {
   const { userId, email } = payload;
@@ -37,28 +39,51 @@ function setRefreshCookie(res: Response, token: string): void {
   });
 }
 
-export async function register(req: Request, res: Response): Promise<void> {
-  const { email, password } = req.body as RegisterRequest;
+function toPublicUser(user: PublicUser): PublicUser {
+  return {
+    id: user.id,
+    email: user.email,
+    username: user.username,
+    full_name: user.full_name,
+    avatar_color: user.avatar_color,
+    account_balance: user.account_balance,
+    created_at: user.created_at,
+  };
+}
 
-  if (!email || !password) {
-    res.status(400).json({ message: 'Email and password are required' });
+export async function register(req: Request, res: Response): Promise<void> {
+  const { email, password, username, full_name, avatar_color } = req.body as RegisterRequest;
+
+  if (!email || !password || !username) {
+    res.status(400).json({ message: 'Email, password, and username are required' });
     return;
   }
 
-  const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+  if (!USERNAME_RE.test(username)) {
+    res.status(400).json({ message: 'Username must be 3-20 characters and contain only letters, numbers, or underscores' });
+    return;
+  }
+
+  const existing = await pool.query(
+    'SELECT id FROM users WHERE email = $1 OR username = $2',
+    [email, username]
+  );
   if ((existing.rowCount ?? 0) > 0) {
-    res.status(400).json({ message: 'Email already registered' });
+    res.status(400).json({ message: 'Email or username already taken' });
     return;
   }
 
   const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
+  const color = avatar_color ?? 'ocean';
 
   const result = await pool.query(
-    'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at',
-    [email, password_hash]
+    `INSERT INTO users (email, username, full_name, password_hash, avatar_color)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, email, username, full_name, avatar_color, account_balance, created_at`,
+    [email, username, full_name ?? null, password_hash, color]
   );
 
-  const user = result.rows[0];
+  const user = result.rows[0] as PublicUser;
   const payload: AuthTokenPayload = { userId: user.id, email: user.email };
 
   const accessToken = issueAccessToken(payload);
@@ -71,7 +96,7 @@ export async function register(req: Request, res: Response): Promise<void> {
 
   setRefreshCookie(res, refreshToken);
 
-  res.status(201).json({ accessToken, user: { id: user.id, email: user.email, created_at: user.created_at } });
+  res.status(201).json({ accessToken, user: toPublicUser(user) });
 }
 
 export async function login(req: Request, res: Response): Promise<void> {
@@ -108,7 +133,7 @@ export async function login(req: Request, res: Response): Promise<void> {
 
   setRefreshCookie(res, refreshToken);
 
-  res.status(200).json({ accessToken, user: { id: user.id, email: user.email } });
+  res.status(200).json({ accessToken, user: toPublicUser(user as PublicUser) });
 }
 
 export async function refresh(req: Request, res: Response): Promise<void> {
@@ -162,4 +187,69 @@ export async function logout(req: Request, res: Response): Promise<void> {
 
   res.clearCookie('refreshToken', { httpOnly: true, sameSite: 'strict' });
   res.status(200).json({ message: 'Logged out' });
+}
+
+export async function getMe(req: AuthenticatedRequest, res: Response): Promise<void> {
+  const result = await pool.query(
+    'SELECT id, email, username, full_name, avatar_color, account_balance, created_at FROM users WHERE id = $1',
+    [req.user?.userId]
+  );
+
+  if ((result.rowCount ?? 0) === 0) {
+    res.status(404).json({ message: 'User not found' });
+    return;
+  }
+
+  res.status(200).json({ user: toPublicUser(result.rows[0] as PublicUser) });
+}
+
+export async function updateMe(req: AuthenticatedRequest, res: Response): Promise<void> {
+  const { username, full_name, avatar_color } = req.body as Partial<Pick<PublicUser, 'username' | 'full_name' | 'avatar_color'>>;
+
+  if (username !== undefined && !USERNAME_RE.test(username)) {
+    res.status(400).json({ message: 'Username must be 3-20 characters and contain only letters, numbers, or underscores' });
+    return;
+  }
+
+  if (username !== undefined) {
+    const taken = await pool.query(
+      'SELECT id FROM users WHERE username = $1 AND id != $2',
+      [username, req.user?.userId]
+    );
+    if ((taken.rowCount ?? 0) > 0) {
+      res.status(400).json({ message: 'Username already taken' });
+      return;
+    }
+  }
+
+  const result = await pool.query(
+    `UPDATE users
+     SET username      = COALESCE($1, username),
+         full_name     = COALESCE($2, full_name),
+         avatar_color  = COALESCE($3, avatar_color)
+     WHERE id = $4
+     RETURNING id, email, username, full_name, avatar_color, account_balance, created_at`,
+    [username ?? null, full_name ?? null, avatar_color ?? null, req.user?.userId]
+  );
+
+  res.status(200).json({ user: toPublicUser(result.rows[0] as PublicUser) });
+}
+
+export async function searchUsers(req: AuthenticatedRequest, res: Response): Promise<void> {
+  const q = typeof req.query['q'] === 'string' ? req.query['q'].trim() : '';
+
+  if (!q) {
+    res.status(400).json({ message: 'Query parameter q is required' });
+    return;
+  }
+
+  const result = await pool.query(
+    `SELECT id, username, full_name, avatar_color
+     FROM users
+     WHERE id != $1 AND (username ILIKE $2 OR full_name ILIKE $2)
+     LIMIT 10`,
+    [req.user?.userId, `%${q}%`]
+  );
+
+  res.status(200).json({ users: result.rows });
 }

@@ -1,8 +1,8 @@
 # BridgePay Registration Service
 
-> JWT authentication and user registration service built on TypeScript, Node.js, and Express.
+> Authentication, user profiles, and social graph for the BridgePay platform.
 
-A portfolio project providing secure authentication for the BridgePay platform — handling user registration, login, and session management via JWT access and refresh token rotation. Built to demonstrate backend engineering skills in TypeScript, Node.js, secure auth patterns, and AWS cloud infrastructure.
+A portfolio project handling user registration, JWT authentication, friend relationships, and account balances for the BridgePay suite. Built to demonstrate backend engineering in TypeScript, Node.js, Express, and PostgreSQL — with planned SQS integration for event-driven balance transfers.
 
 ---
 
@@ -11,7 +11,7 @@ A portfolio project providing secure authentication for the BridgePay platform �
 | Layer | Technology |
 |---|---|
 | Language | TypeScript |
-| Runtime | Node.js |
+| Runtime | Node.js 20 |
 | Framework | Express |
 | Database (local) | PostgreSQL — Docker |
 | Database (production) | PostgreSQL — AWS RDS |
@@ -25,118 +25,86 @@ A portfolio project providing secure authentication for the BridgePay platform �
 
 ## Architecture
 
+This service is the identity and social layer of the BridgePay suite. It issues JWTs that are validated by `bridgepay-payment-processor` on every payment request. Planned: consumes `PaymentCreatedEvent` from SQS to perform atomic balance transfers, then publishes `PaymentProcessedEvent` or `PaymentFailedEvent` back to the payment processor.
+
 ```
 HTTP Request
      │
      ▼
-Auth Router                (/api/auth)
+Auth / Users / Friends Router
      │
      ▼
-Auth Controller            (Business logic — registration, login, token rotation)
+Controllers         (auth, users, friends)
      │
-     ├──▶ pg Pool              (PostgreSQL — users, refresh_tokens tables)
+     ├──▶ pg Pool       (PostgreSQL — users, refresh_tokens, friendships)
      │
-     └──▶ JWT Utilities        (Access token: 15m · Refresh token: 7d, HttpOnly cookie)
-               │
-               ▼
-          Token Rotation       (Old refresh token revoked on every use)
+     └──▶ JWT Utilities (Access: 15m · Refresh: 7d, HttpOnly cookie, DB-backed rotation)
+
+[Planned]
+SQS Consumer ──▶ Balance Transfer Logic ──▶ SQS Publisher
+(PaymentCreatedEvent)                    (PaymentProcessedEvent / PaymentFailedEvent)
 ```
-
----
-
-## Auth Flow
-
-```
-POST /api/auth/register
-     │
-     ▼
-Hash password (bcryptjs) → Insert user → Issue access token + refresh token
-     │                                          │
-     ▼                                          ▼
-201 Created + accessToken              HttpOnly cookie (refreshToken)
-
-POST /api/auth/login
-     │
-     ▼
-Verify password → Issue access token + refresh token
-     │                      │
-     ▼                      ▼
-200 OK + accessToken   HttpOnly cookie (refreshToken)
-
-POST /api/auth/refresh
-     │
-     ▼
-Validate refresh token → Revoke old token → Issue new access + refresh tokens
-     │                                              │
-     ▼                                              ▼
-200 OK + new accessToken                  HttpOnly cookie (new refreshToken)
-
-POST /api/auth/logout
-     │
-     ▼
-Delete refresh token from DB → Clear cookie → 200 OK
-```
-
----
-
-## AWS Infrastructure
-
-| Component | Service | Details |
-|---|---|---|
-| Container Registry | Amazon ECR | Stores Docker image |
-| Container Host | Amazon ECS Fargate | Runs containerized Node.js app |
-| Database | Amazon RDS PostgreSQL | Production persistence |
-| Load Balancer | Application Load Balancer | Public-facing HTTP endpoint |
 
 ---
 
 ## API Endpoints
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/auth/register` | Register a new user |
-| `POST` | `/api/auth/login` | Login and receive tokens |
-| `POST` | `/api/auth/refresh` | Rotate refresh token, receive new access token |
-| `POST` | `/api/auth/logout` | Revoke refresh token and clear cookie |
+### Auth
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `POST` | `/api/auth/register` | None | Register — email, password, username, full_name (optional), avatar_color (optional) |
+| `POST` | `/api/auth/login` | None | Login — returns accessToken + full user profile |
+| `POST` | `/api/auth/refresh` | Cookie | Rotate refresh token, receive new access token |
+| `POST` | `/api/auth/logout` | Bearer | Revoke refresh token and clear cookie |
 
-### Register — Example Request
-```bash
-curl -X POST http://localhost:3000/api/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email": "user@bridgepay.com", "password": "SecurePassword123"}'
-```
+### Users
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/users/me` | Bearer | Get current user profile |
+| `PATCH` | `/api/users/me` | Bearer | Update username, full_name, avatar_color |
+| `GET` | `/api/users/search?q=` | Bearer | Search users by username or full name (excludes self) |
 
-### Example Response
-```json
-{
-  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "user": {
-    "id": "03f022be-18a1-4292-80e5-e3da5799fc60",
-    "email": "user@bridgepay.com",
-    "created_at": "2026-03-20T23:22:26.235Z"
-  }
-}
-```
+### Friends
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `POST` | `/api/friends/request` | Bearer | Send friend request by username |
+| `GET` | `/api/friends` | Bearer | Get accepted friends list |
+| `GET` | `/api/friends/requests` | Bearer | Get incoming pending requests |
+| `PATCH` | `/api/friends/request/:id` | Bearer | Accept or decline a request |
+| `DELETE` | `/api/friends/:id` | Bearer | Unfriend by user ID |
 
-### Login — Example Request
-```bash
-curl -X POST http://localhost:3000/api/auth/login \
-  -H "Content-Type: application/json" \
-  -c cookies.txt \
-  -d '{"email": "user@bridgepay.com", "password": "SecurePassword123"}'
-```
+---
 
-### Refresh — Example Request
-```bash
-curl -X POST http://localhost:3000/api/auth/refresh \
-  -b cookies.txt \
-  -c cookies.txt
-```
+## Database Schema
 
-### Logout — Example Request
-```bash
-curl -X POST http://localhost:3000/api/auth/logout \
-  -b cookies.txt
+```sql
+CREATE TABLE users (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email           TEXT UNIQUE NOT NULL,
+  username        TEXT UNIQUE NOT NULL,
+  full_name       TEXT,
+  password_hash   TEXT NOT NULL,
+  avatar_color    TEXT NOT NULL DEFAULT 'ocean',
+  account_balance DECIMAL(12,2) NOT NULL DEFAULT 1000.00,
+  created_at      TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE refresh_tokens (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token      TEXT UNIQUE NOT NULL,
+  expires_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE friendships (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  friend_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status     TEXT NOT NULL DEFAULT 'pending',
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  UNIQUE(user_id, friend_id)
+);
 ```
 
 ---
@@ -145,12 +113,39 @@ curl -X POST http://localhost:3000/api/auth/logout \
 
 | Concern | Implementation |
 |---|---|
-| Password storage | bcryptjs hashing — plaintext never persisted |
+| Password storage | bcryptjs — plaintext never persisted |
 | Access token lifetime | 15 minutes — short window limits exposure |
 | Refresh token storage | HttpOnly cookie — inaccessible to JavaScript |
-| Refresh token rotation | Old token revoked on every use — stolen tokens invalidated after one use |
-| Refresh token revocation | Stored in DB — can be invalidated server-side at any time |
-| JWT secrets | Environment variables — never hardcoded or committed |
+| Refresh token rotation | Old token revoked on every use |
+| Refresh token revocation | DB-backed — invalidatable server-side at any time |
+| JWT secrets | Environment variables — never hardcoded |
+
+---
+
+## Running Locally
+
+### Prerequisites
+- Docker Desktop
+
+### Start all services
+```bash
+docker-compose up --build
+```
+
+The registration service retries the DB connection up to 10 times with a 3-second delay — handles postgres startup lag automatically.
+
+### Environment variables (docker-compose sets these automatically)
+
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `JWT_ACCESS_SECRET` | Access token signing secret |
+| `JWT_REFRESH_SECRET` | Refresh token signing secret |
+| `ACCESS_TOKEN_EXPIRY` | Access token lifetime (default: `15m`) |
+| `REFRESH_TOKEN_EXPIRY` | Refresh token lifetime (default: `7d`) |
+| `PORT` | Service port (default: `3000`) |
+| `NODE_ENV` | Environment (`development` / `production`) |
+| `CORS_ORIGIN` | Allowed origin (default: `http://localhost:5173`) |
 
 ---
 
@@ -159,103 +154,20 @@ curl -X POST http://localhost:3000/api/auth/logout \
 ```
 src/
 ├── controllers/
-│   └── authController.ts    # register, login, refresh, logout — bcrypt, JWT, token rotation
+│   ├── authController.ts      # register, login, refresh, logout
+│   └── friendsController.ts   # friend requests, search, unfriend
 ├── db/
-│   ├── pool.ts              # pg.Pool singleton using DATABASE_URL
-│   └── migrate.ts           # CREATE TABLE IF NOT EXISTS — users, refresh_tokens
+│   ├── pool.ts                # pg.Pool singleton
+│   └── migrate.ts             # Schema migration — runs on startup
 ├── middleware/
-│   └── authenticateToken.ts # Bearer token verification — attaches req.user
+│   └── authenticateToken.ts   # Bearer token verification
 ├── models/
-│   └── user.ts              # User, RegisterRequest, LoginRequest, AuthTokenPayload interfaces
+│   └── user.ts                # User, Friendship, PublicUser interfaces
 ├── routes/
-│   └── auth.ts              # POST /register, /login, /refresh, /logout
-└── index.ts                 # Express app entry point — mounts /api/auth router
-```
-
----
-
-## Running Locally
-
-### Prerequisites
-
-- Node.js 20+
-- Docker (for local PostgreSQL)
-
-### 1. Start local PostgreSQL
-
-```bash
-docker run --name bridgepay-registration-db \
-  -e POSTGRES_USER=bridgepay_admin \
-  -e POSTGRES_PASSWORD=localpassword \
-  -e POSTGRES_DB=bridgepay_registration \
-  -p 5432:5432 \
-  -d postgres:16
-```
-
-### 2. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Fill in `.env`:
-
-| Variable | Local Value |
-|---|---|
-| `DATABASE_URL` | `postgresql://bridgepay_admin:localpassword@localhost:5432/bridgepay_registration` |
-| `JWT_ACCESS_SECRET` | Any long random string |
-| `JWT_REFRESH_SECRET` | Different long random string |
-| `ACCESS_TOKEN_EXPIRY` | `15m` |
-| `REFRESH_TOKEN_EXPIRY` | `7d` |
-| `PORT` | `3000` |
-| `NODE_ENV` | `development` |
-
-Generate JWT secrets:
-```bash
-node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
-```
-
-### 3. Run database migration
-
-```bash
-npm run migrate
-```
-
-### 4. Start the dev server
-
-```bash
-npm run dev
-```
-
-The app starts on `http://localhost:3000`.
-
----
-
-## Running Tests
-
-```bash
-npm test
-```
-
----
-
-## Docker
-
-### Build the image
-```bash
-docker build -t bridgepay-registration-service .
-```
-
-### Run the container
-```bash
-docker run -p 3000:3000 \
-  -e DATABASE_URL=<your-rds-url> \
-  -e JWT_ACCESS_SECRET=<secret> \
-  -e JWT_REFRESH_SECRET=<secret> \
-  -e ACCESS_TOKEN_EXPIRY=15m \
-  -e REFRESH_TOKEN_EXPIRY=7d \
-  -e NODE_ENV=production \
-  bridgepay-registration-service
+│   ├── auth.ts                # /api/auth
+│   ├── users.ts               # /api/users
+│   └── friends.ts             # /api/friends
+└── index.ts                   # Express app — startup with DB retry loop
 ```
 
 ---
@@ -263,19 +175,20 @@ docker run -p 3000:3000 \
 ## Roadmap
 
 ### Completed
-- [x] User registration with bcryptjs password hashing
-- [x] Login with JWT access token issuance
-- [x] Refresh token rotation — HttpOnly cookie, DB-backed revocation
-- [x] Logout with server-side token invalidation
-- [x] PostgreSQL schema — users and refresh_tokens tables
-- [x] JWT middleware for protecting downstream routes
+- [x] Auth endpoints — register, login, refresh token rotation, logout
+- [x] User profiles — username, full name, avatar color, account balance
+- [x] Friends system — request, accept, decline, unfriend, search
+- [x] JWT authentication middleware
+- [x] Refresh token rotation and revocation
+- [x] Docker + docker-compose local dev setup
+- [x] DB retry loop for container startup sequencing
 
 ### Planned
-- [ ] Dockerfile and containerization
-- [ ] GitHub Actions CI/CD pipeline — build, test, push to ECR
-- [ ] Deploy to AWS ECS Fargate with Application Load Balancer (via Terraform)
-- [ ] Integration with payment-processor — JWT validation on payment endpoints
-- [ ] Integration tests
+- [ ] SQS consumer for `PaymentCreatedEvent` — friendship validation + atomic balance transfer
+- [ ] SQS publisher for `PaymentProcessedEvent` / `PaymentFailedEvent`
+- [ ] GitHub Actions CI/CD pipeline
+- [ ] Deploy to AWS ECS Fargate via Terraform
+- [ ] K6 load tests
 
 ---
 
@@ -283,9 +196,10 @@ docker run -p 3000:3000 \
 
 | Repo | Stack | Description |
 |---|---|---|
-| `bridgepay-payment-processor` | Java 21 / Spring Boot / AWS SQS | Core payment lifecycle API |
+| `bridgepay-payment-processor` | Java 21 / Spring Boot / AWS SQS / PostgreSQL | Core payment lifecycle API |
 | `bridgepay-notification-service` | Kotlin / Spring Boot / AWS SQS | Lifecycle notification dispatcher |
-| `bridgepay-dashboard` | React | Frontend — payment status, transaction history, onboarding |
+| `bridgepay-dashboard` | React / Vite / TypeScript | Frontend — social feed, payments, friends, account |
+| `bridgepay-terraform` | Terraform | AWS infrastructure for all services |
 
 ---
 
